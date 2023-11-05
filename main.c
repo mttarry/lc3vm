@@ -3,7 +3,6 @@
 #include <stdlib.h>
 #include <stdbool.h>
 
-// 65536 memory locations
 #define MEMORY_MAX (1 << 16)
 
 enum {
@@ -47,10 +46,22 @@ enum
     FL_NEG = 1 << 2, /* N */
 };
 
+enum 
+{
+    TRAP_GETC = 0x20,
+    TRAP_OUT,
+    TRAP_PUTS,
+    TRAP_IN,
+    TRAP_PUTSP,
+    TRAP_HALT
+};
+
 
 typedef struct CPU {
     uint16_t reg[R_COUNT];
     uint16_t mem[MEMORY_MAX];
+    uint16_t curr_instr;
+    bool running;
 } CPU;
 
 
@@ -98,59 +109,218 @@ void update_flags(CPU *cpu, uint16_t result) {
     }
 }
 
-void add(CPU *cpu, uint16_t instr) {
-    uint16_t dreg = (instr >> 9) & 0x3;
-    uint16_t sreg_1 = (instr >> 6) & 0x3;
+void add(CPU *cpu) {
+    uint16_t dreg = (cpu->curr_instr >> 9) & 0x7;
+    uint16_t sreg_1 = (cpu->curr_instr >> 6) & 0x7;
 
-    if ((instr >> 5) & 0x1) {
-        uint16_t imm5 = instr & 0x1F;
+    if ((cpu->curr_instr >> 5) & 0x1) {
+        uint16_t imm5 = cpu->curr_instr & 0x1F;
         cpu->reg[dreg] = cpu->reg[sreg_1] + sign_extend(imm5, 5);
     }
     else {
-        uint16_t sreg_2 = (instr & 0x3);
+        uint16_t sreg_2 = (cpu->curr_instr & 0x7);
         cpu->reg[dreg] = cpu->reg[sreg_1] + cpu->reg[sreg_2];
     }
 
     update_flags(cpu, cpu->reg[dreg]);
 }
 
-void and(CPU *cpu, uint16_t instr) {
-    uint16_t dreg = (instr >> 9) & 0x3;
-    uint16_t sreg_1 = (instr >> 6) & 0x3;
+void and(CPU *cpu) {
+    uint16_t dreg = (cpu->curr_instr >> 9) & 0x7;
+    uint16_t sreg_1 = (cpu->curr_instr >> 6) & 0x7;
 
-    if ((instr >> 5) & 0x1) {
-        uint16_t imm5 = instr & 0x1F;
+    if ((cpu->curr_instr >> 5) & 0x1) {
+        uint16_t imm5 = cpu->curr_instr & 0x1F;
         cpu->reg[dreg] = cpu->reg[sreg_1] & sign_extend(imm5, 5);
     }
     else {
-        uint16_t sreg_2 = (instr & 0x3);
+        uint16_t sreg_2 = (cpu->curr_instr & 0x7);
         cpu->reg[dreg] = cpu->reg[sreg_1] & cpu->reg[sreg_2];
     }
 
     update_flags(cpu, cpu->reg[dreg]);
 }
 
-void branch(CPU *cpu, uint16_t instr) {
-    uint16_t cond = instr >> 9;
-    uint16_t offset = instr & 0x1FF;
+void branch(CPU *cpu) {
+    uint16_t cond = cpu->curr_instr >> 9;
+    uint16_t offset9 = cpu->curr_instr & 0x1FF;
 
     bool test_pos = (cond & 0x1) && (cpu->reg[R_COND] == FL_POS);
     bool test_zro = ((cond >> 1) & 0x1) && (cpu->reg[R_COND] == FL_ZRO);
     bool test_neg = ((cond >> 2) & 0x1) && (cpu->reg[R_COND] == FL_NEG);
     
     if (test_pos || test_zro || test_neg) {
-        cpu->reg[R_PC] += sign_extend(offset, 9);
+        cpu->reg[R_PC] += sign_extend(offset9, 9);
     }
 }
 
-void load(CPU *cpu, uint16_t instr) {
-    uint16_t dreg = (instr >> 9) & 0x3;
-    uint16_t offset = instr & 0x1F;
-    uint16_t load_addr = cpu->reg[R_PC] + sign_extend(offset, 9);
+void load(CPU *cpu) {
+    uint16_t dreg = (cpu->curr_instr >> 9) & 0x7;
+    uint16_t offset9 = cpu->curr_instr & 0x1FF;
+    uint16_t load_addr = cpu->reg[R_PC] + sign_extend(offset9, 9);
 
     cpu->reg[dreg] = cpu->mem[load_addr];
 
     update_flags(cpu, cpu->reg[dreg]);
+}
+
+void load_indirect(CPU *cpu) {
+    uint16_t dreg = (cpu->curr_instr >> 9) & 0x7;
+    uint16_t offset9 = cpu->curr_instr & 0x1FF;
+    uint16_t load_addr = cpu->mem[cpu->reg[R_PC] + sign_extend(offset9, 9)];
+
+    cpu->reg[dreg] = cpu->mem[load_addr];
+
+    update_flags(cpu, cpu->reg[dreg]);
+}
+
+void not(CPU *cpu) {
+    uint16_t dreg = (cpu->curr_instr >> 9) & 0x7;
+    uint16_t sreg = (cpu->curr_instr >> 6) & 0x7;
+
+    cpu->reg[dreg] = ~cpu->reg[sreg];
+
+    update_flags(cpu, cpu->reg[dreg]);
+}
+
+void store(CPU *cpu) {
+    uint16_t sreg = (cpu->curr_instr >> 9) & 0x7;
+    uint16_t offset9 = cpu->curr_instr & 0x1FF;
+    uint16_t store_addr = cpu->reg[R_PC] + sign_extend(offset9, 9);
+
+    cpu->mem[store_addr] = cpu->reg[sreg];
+}
+
+void store_indirect(CPU *cpu) {
+    uint16_t sreg = (cpu->curr_instr >> 9) & 0x7;
+    uint16_t offset9 = cpu->curr_instr & 0x1FF;
+    uint16_t store_addr = cpu->mem[cpu->reg[R_PC] + sign_extend(offset9, 9)];
+    
+    cpu->mem[store_addr] = cpu->reg[sreg];
+}
+
+void load_boffset(CPU *cpu) {
+    uint16_t dreg = (cpu->curr_instr >> 9) & 0x7;
+    uint16_t baseR = (cpu->curr_instr >> 6) & 0x7;
+    uint16_t offset6 = cpu->curr_instr & 0x3F;
+
+    cpu->reg[dreg] = cpu->mem[cpu->reg[baseR] + sign_extend(offset6, 6)];
+
+    update_flags(cpu, cpu->reg[dreg]);
+}
+
+void jump_subroutine(CPU *cpu) {
+    cpu->reg[R_R7] = cpu->reg[R_PC];
+    
+    if ((cpu->curr_instr >> 11) & 0x1) {
+        uint16_t offset11 = cpu->curr_instr & 0x7FF;
+        cpu->reg[R_PC] += sign_extend(offset11, 11);
+    }
+    else {
+        uint16_t baseR = (cpu->curr_instr >> 6) & 0x7;
+        cpu->reg[R_PC] = cpu->reg[baseR];
+    }
+}
+
+void jump(CPU *cpu) {
+    uint16_t baseR = (cpu->curr_instr >> 6) & 0x7;
+
+    cpu->reg[R_PC] = cpu->reg[baseR];
+}
+
+void store_boffset(CPU *cpu) {
+    uint16_t sreg = (cpu->curr_instr >> 9) & 0x7;
+    uint16_t baseR = (cpu->curr_instr >> 6) & 0x7;
+    uint16_t offset6 = cpu->curr_instr & 0x3F;
+    uint16_t store_addr = cpu->reg[baseR] + sign_extend(offset6, 6);
+
+    cpu->mem[store_addr] = cpu->reg[sreg];
+}
+
+void load_effective_addr(CPU *cpu) {
+    uint16_t dreg = (cpu->curr_instr >> 9) & 0x7;
+    uint16_t offset9 = cpu->curr_instr & 0x1FF;
+
+    cpu->reg[dreg] = cpu->reg[R_PC] + sign_extend(offset9, 9);
+
+    update_flags(cpu, cpu->reg[dreg]);
+}
+
+void trap_getc(CPU *cpu) {
+    cpu->reg[R_R0] = getchar();
+    update_flags(cpu, cpu->reg[R_R0]);
+}
+
+void trap_out(CPU *cpu) {
+    putchar((char)cpu->reg[R_R0]);
+}
+
+void trap_halt(CPU *cpu) {
+    puts("HALT\n");
+    fflush(stdout);
+    cpu->running = false;
+}
+
+void trap_puts(CPU *cpu) {
+    uint16_t *c = cpu->mem + cpu->reg[R_R0];
+
+    while (*c) {
+        putc(*c, stdout);
+        ++c;
+    }
+
+    fflush(stdout);
+}
+
+void trap_in(CPU *cpu) {
+    printf("Enter a character: ");
+    char c = getchar();
+    putc(c, stdout);
+    cpu->reg[R_R0] = (uint16_t)c;
+    update_flags(cpu, cpu->reg[R_R0]);
+}
+
+void trap_putsp(CPU *cpu) {
+    uint16_t *c = cpu->mem + cpu->reg[R_R0];
+
+    while (*c) {
+        char c1 = *c & 0xFF;
+        putc(c1, stdout);
+        
+        char c2 = (*c >> 8);
+        if (c2) putc(c2, stdout);
+        
+        ++c;
+    }
+
+    fflush(stdout);
+}
+
+void trap(CPU *cpu) {
+    uint16_t trapvec = cpu->curr_instr & 0xFF;
+
+    switch (trapvec) {
+        case TRAP_GETC:
+            trap_getc(cpu);
+            break;
+        case TRAP_OUT:
+            trap_out(cpu);
+            break;
+        case TRAP_PUTS:
+            trap_puts(cpu);
+            break;
+        case TRAP_IN:
+            trap_in(cpu);
+            break;
+        case TRAP_PUTSP:
+            trap_putsp(cpu);
+            break;
+        case TRAP_HALT:
+            trap_halt(cpu);
+            break;
+        default:
+            break;
+    }
 }
 
 void print_regs(CPU *cpu) {
@@ -167,61 +337,81 @@ void print_regs(CPU *cpu) {
 }
 
 void execute(CPU *cpu) {
-    int running = 1;
+    cpu->running = true;
 
-    while (running) {
+    while (cpu->running) {
         // Get next instruction
         printf("PC: %x\n", cpu->reg[R_PC]);
-        uint16_t instr = cpu->mem[cpu->reg[R_PC]++];
-        uint16_t opcode = instr >> 12;
+        cpu->curr_instr = cpu->mem[cpu->reg[R_PC]++];
+        uint16_t opcode = cpu->curr_instr >> 12;
 
-        printf("instruction: %x\n", instr);
+        printf("instruction: %x\n", cpu->curr_instr);
         print_regs(cpu);
-        
-        if (instr == 0) break;
 
         switch (opcode) {
             case OP_BR:
                 printf("BR\n");
-                branch(cpu, instr);
+                branch(cpu);
                 break;
             case OP_ADD:
                 printf("ADD\n");
-                add(cpu, instr);
+                add(cpu);
                 break;
             case OP_LD:
-                load(cpu, instr);
+                printf("LOAD\n");
+                load(cpu);
                 break;     
             case OP_ST:
-                break;     
+                printf("ST\n");
+                store(cpu);
+                break;
             case OP_JSR:
+                printf("JSR\n");
+                jump_subroutine(cpu);
                 break;
             case OP_AND:
                 printf("AND\n");
-                and(cpu, instr);
+                and(cpu);
                 break;   
             case OP_LDR:
+                printf("LDR\n");
+                load_boffset(cpu);
                 break;  
             case OP_STR:
+                printf("STR\n");
+                store_boffset(cpu);
                 break;    
             case OP_RTI:
                 break;    
             case OP_NOT:
+                printf("NOT\n");
+                not(cpu);
                 break;   
             case OP_LDI:
+                printf("LDI\n");
+                load_indirect(cpu);
                 break;   
             case OP_STI:
+                printf("STI\n");
+                store_indirect(cpu);
                 break;   
             case OP_JMP:
+                printf("JMP\n");
+                jump(cpu);
                 break;   
             case OP_RES:
                 break;  
             case OP_LEA:
+                printf("LEA\n");
+                load_effective_addr(cpu);
                 break;   
             case OP_TRAP:
+                printf("TRAP\n");
+                trap(cpu);
                 break;
             default:
-                running = 0;
+                printf("Error: Invalid opcode. Halting...\n");
+                cpu->running = false;
                 break;
         }
     }
@@ -230,7 +420,7 @@ void execute(CPU *cpu) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("Usage ./lc3 [LC3_BINARY_FILE]\n");
-        exit(EXIT_FAILURE);
+        exit(2);
     }
 
     FILE *f;
@@ -246,8 +436,6 @@ int main(int argc, char **argv) {
     read_image(f, &cpu);
 
     execute(&cpu);
-
-
 
     fclose(f);
 }
